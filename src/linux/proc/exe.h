@@ -20,24 +20,38 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifndef HEAP_H
-#define HEAP_H
+#pragma once
 
-#include <sys/types.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-typedef struct {
-    void   * lo;
-    void   * hi;
-    void   * newlo;
-    void   * newhi;
-} _mem_block_t;
+#include "../../error.h"
+#include "../../hints.h"
 
+#define DELETED_SUFFIX " (deleted)"
 
-typedef struct {
-    void   * content;
-    size_t   size;
-} _heap_t;
+// ----------------------------------------------------------------------------
+static int
+proc_exe_readlink(pid_t pid, char* dest, ssize_t size) {
+    char file_name[32];
 
-#define NULL_MEM_BLOCK ((_mem_block_t) {(void *) -1, NULL, (void *) -1, NULL})
+    sprintf(file_name, "/proc/%d/exe", pid);
 
-#endif
+    ssize_t len = readlink(file_name, dest, size - 1);
+    if (len == -1) {
+        set_error(IO, "Cannot read symbolic link for executable");
+        FAIL; // cppcheck-suppress [resourceLeak]
+    }
+    // readlink() never null-terminates the buffer itself.
+    dest[len] = '\0';
+
+    // Handle deleted files
+    char* suffix = strstr(dest, DELETED_SUFFIX);
+    if (isvalid(suffix)) {
+        *suffix = '\0';
+    }
+
+    SUCCESS;
+}

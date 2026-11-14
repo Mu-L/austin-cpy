@@ -23,11 +23,14 @@
 import importlib
 import os
 import platform
+import socket
+import sys
 from asyncio.subprocess import STDOUT
 from collections import Counter
 from collections import defaultdict
+from functools import cached_property
 from io import BytesIO
-from io import StringIO
+from itertools import count
 from pathlib import Path
 from shutil import rmtree
 from subprocess import PIPE
@@ -38,12 +41,22 @@ from subprocess import TimeoutExpired
 from subprocess import check_output
 from tempfile import gettempdir
 from test import PYTHON_VERSIONS
+from test import _ver_tuple
+from time import monotonic
 from time import sleep
+from types import FrameType
 from types import ModuleType
+from typing import Callable
+from typing import Dict
 from typing import Iterator
 from typing import List
+from typing import Optional
+from typing import Tuple
 from typing import TypeVar
 from typing import Union
+
+if sys.platform == "win32":
+    from subprocess import CREATE_NEW_PROCESS_GROUP
 
 
 try:
@@ -51,8 +64,8 @@ try:
 except ImportError:
     pytest = None
 
-from austin.format.mojo import MojoFile
-
+from austin.events import AustinSample
+from austin.format.mojo import MojoStreamReader
 
 HERE = Path(__file__).parent
 
@@ -61,16 +74,29 @@ def target(name: str = "target34.py") -> str:
     return str(HERE / "targets" / name)
 
 
+def version_in(py: str, text: str) -> bool:
+    """Check whether Austin's version output for `py` appears in `text`.
+
+    Austin emits the full patch version, e.g. '3.13.13t' for py='3.13t' or
+    '3.13.1' for py='3.13'. For free-threaded builds the 't' suffix is
+    appended after the patch number, so a simple substring search won't work.
+    """
+    import re
+
+    base = py.rstrip("t")
+    ft = py.endswith("t")
+    pattern = re.escape(base) + r"\.\d+" + ("t" if ft else "")
+    return bool(re.search(pattern, text))
+
+
 def allpythons(min=None, max=None):
     def _(f):
         versions = PYTHON_VERSIONS
         if min is not None:
-            versions = [_ for _ in versions if _ >= min]
+            versions = [v for v in versions if _ver_tuple(v) >= min]
         if max is not None:
-            versions = [_ for _ in versions if _ <= max]
-        return pytest.mark.parametrize(
-            "py", [".".join([str(_) for _ in v]) for v in versions]
-        )(f)
+            versions = [v for v in versions if _ver_tuple(v) <= max]
+        return pytest.mark.parametrize("py", versions)(f)
 
     return _
 
@@ -92,10 +118,10 @@ def python(version: str) -> list[str]:
         check_output([*py, "-V"], stderr=STDOUT)
         return py
     except FileNotFoundError:
-        pytest.skip(f"Python {version} not found")
+        return pytest.skip(f"Python {version} not found")
 
 
-def gdb(cmds: list[str], *args: tuple[str]) -> str:
+def gdb(cmds: list[str], *args: str) -> str:
     return check_output(
         ["gdb", "-q", "-batch"]
         + [_ for cs in (("-ex", _) for _ in cmds) for _ in cs]
@@ -126,7 +152,7 @@ def bt(binary: Path, pid: int) -> str:
             target_dir = Path(crash.stem)
             apport_unpack(crash, target_dir)
 
-            result = gdb(["bt full", "q"], str(binary), target_dir / "CoreDump")
+            result = gdb(["bt full", "q"], str(binary), str(target_dir / "CoreDump"))
 
             crash.unlink()
             rmtree(str(target_dir))
@@ -137,9 +163,10 @@ def bt(binary: Path, pid: int) -> str:
 
 
 def collect_logs(variant: str, pid: int) -> List[str]:
+    needles: tuple[str, ...]
     match platform.system():
         case "Linux":
-            with Path("/var/log/syslog").open() as logfile:
+            with Path("/var/log/syslog").open(errors="replace") as logfile:
                 needles = (f"{variant}[{pid}]", f"systemd-coredump[{pid}]")
                 return [
                     f" logs for {variant}[{pid}] ".center(80, "="),
@@ -184,7 +211,7 @@ def run(
     if capture_output:
         if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
             raise ValueError(
-                "stdout and stderr arguments may not be used " "with capture_output."
+                "stdout and stderr arguments may not be used with capture_output."
             )
         kwargs["stdout"] = PIPE
         kwargs["stderr"] = PIPE
@@ -206,11 +233,11 @@ def run(
             raise
         retcode = process.poll()
         if check and retcode:
-            exc = CalledProcessError(
+            error = CalledProcessError(
                 retcode, process.args, output=stdout, stderr=stderr
             )
-            exc.pid = process.pid
-            raise exc
+            error.pid = process.pid
+            raise error
     result = CompletedProcess(process.args, retcode, stdout, stderr)
     result.pid = process.pid
 
@@ -220,87 +247,199 @@ def run(
 def print_logs(logs: List[str]) -> None:
     if logs:
         for log in logs:
-            print(log)
+            print(log, file=sys.stderr)
     else:
-        print("<< no logs available >>")
+        print("<< no logs available >>", file=sys.stderr)
 
 
-class Variant(str):
+(DUMP_PATH := HERE.parent / "dumps").mkdir(exist_ok=True)
+
+
+def dump_mojo(data: bytes) -> None:
+    frame: Optional[FrameType] = sys._getframe(1)
+
+    while not (frame is None or frame.f_code.co_name.startswith("test_")):
+        frame = frame.f_back
+
+    if frame is None:
+        return
+
+    test_name = frame.f_code.co_name
+
+    for i in count(1):
+        dump_file = DUMP_PATH / f"{test_name}_{i}.mojo"
+        if not dump_file.is_file():
+            dump_file.write_bytes(data)
+            print(f"Dumped mojo data to {dump_file}")
+            return
+
+
+class Variant:
     ALL: list["Variant"] = []
 
     def __init__(self, name: str) -> None:
         super().__init__()
 
+        self.name = name
+        self.args = tuple()
+        self.timeout = 60
+        self.expect_fail = False
+        self.convert = True
+
         path = (Path("src") / name).with_suffix(EXEEXT)
         if not path.is_file():
             path = Path(name).with_suffix(EXEEXT)
 
-        self.name = name
         self.path = path
 
-        self.ALL.append(self)
+        if self.path.is_file():
+            self.ALL.append(self)
+
+    @cached_property
+    def help(self) -> str:
+        try:
+            return run(
+                [str(self.path), "--help"],
+                capture_output=True,
+            ).stdout.decode()
+        except (FileNotFoundError, RuntimeError):
+            return "No help available for this variant."
 
     def __call__(
         self,
         *args: str,
         timeout: int = 60,
-        mojo: bool = False,
         convert: bool = True,
         expect_fail: Union[bool, int] = False,
     ) -> CompletedProcess:
         if not self.path.is_file():
-            pytest.skip(f"Variant '{self}' not available")
+            if "PYTEST_CURRENT_TEST" in os.environ:
+                pytest.skip(f"{self} not available")
+            else:
+                raise FileNotFoundError(f"Binary {self.path} not found for {self}")
 
-        mojo_args = ["-b"] if mojo else []
+        extra_args = ["-b"] if "-b, --binary" in self.help else []
 
         try:
+            flags = 0
+            if sys.platform == "win32":
+                flags = CREATE_NEW_PROCESS_GROUP
+
             result = run(
-                [str(self.path)] + mojo_args + list(args),
+                [str(self.path)] + extra_args + list(args),
                 capture_output=True,
                 timeout=timeout,
+                creationflags=flags,
             )
         except Exception as exc:
             if (pid := getattr(exc, "pid", None)) is not None:
                 print_logs(collect_logs(self.name, pid))
             raise
 
+        return self.prepare_result(result, expect_fail, convert)
+
+    def prepare_result(self, result, expect_fail, convert):
         if result.returncode in (-11, 139):  # SIGSEGV
             print(bt(self.path, result.pid))
 
-        if mojo and not ({"-o", "-w", "--output", "--where"} & set(args)):
-            # We produce MOJO binary data only if we are not writing to file
-            # or using the "where" option.
+        # If we are writing to stdout, check if we need to convert the stream
+        if result.stdout.startswith(b"MOJ"):
             if convert:
-                result.stdout = demojo(result.stdout)
+                try:
+                    result.samples, result.metadata = parse_mojo(result.stdout)
+                except Exception as e:
+                    dump_mojo(result.stdout)
+                    raise e
         else:
-            result.stdout = result.stdout.decode(errors="ignore")
+            result.stdout = result.stdout.decode()
         result.stderr = result.stderr.decode()
 
         logs = collect_logs(self.name, result.pid)
         result.logs = logs
 
-        if result.returncode != int(expect_fail):
-            print_logs(logs)
+        if isinstance(expect_fail, bool) and expect_fail is bool(result.returncode):
+            return result
 
-        return result
+        if isinstance(expect_fail, int) and result.returncode == expect_fail:
+            return result
+
+        print_logs(logs)
+        raise RuntimeError(
+            f"Command {self.name} returned {result.returncode} "
+            f"while expecting {expect_fail}. Output:\n{result.stdout}\n"
+            f"Error:\n{result.stderr}"
+        )
+
+    def __enter__(self):
+        if not self.path.is_file():
+            if "PYTEST_CURRENT_TEST" in os.environ:
+                pytest.skip(f"{self} not available")
+            else:
+                raise FileNotFoundError(f"Binary {self.path} not found for {self}")
+
+        extra_args = ["-b"] if "-b, --binary" in self.help else []
+
+        try:
+            flags = 0
+            if sys.platform == "win32":
+                flags = CREATE_NEW_PROCESS_GROUP
+
+            self.subprocess = Popen(
+                [str(self.path)] + extra_args + list(self.args),
+                stdout=PIPE,
+                stderr=PIPE,
+                creationflags=flags,
+            )
+        except Exception as exc:
+            if (pid := getattr(exc, "pid", None)) is not None:
+                print_logs(collect_logs(self.name, pid))
+            raise
+
+        return self.subprocess
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.subprocess.wait(timeout=10)
+
+        result = self.subprocess
+
+        result.stdout = result.stdout.read()
+        result.stderr = result.stderr.read()
+
+        self.prepare_result(result, self.expect_fail, self.convert)
+
+        self.args = tuple()
+        self.timeout = 60
+        self.expect_fail = False
+        self.convert = True
+
+        return False
+
+    def __repr__(self) -> str:
+        return f"Variant({self.name!r})"
 
 
 austin = Variant("austin")
 austinp = Variant("austinp")
 
 
-def run_async(command: list[str], *args: tuple[str], env: dict | None = None) -> Popen:
-    return Popen(command + list(args), stdout=PIPE, stderr=PIPE, env=env)
+def run_async(
+    command: list[str],
+    *args: str,
+    env: dict | None = None,
+    cwd: str | Path | None = None,
+) -> Popen:
+    return Popen(command + list(args), stdout=PIPE, stderr=PIPE, env=env, cwd=cwd)
 
 
 def run_python(
     version,
-    *args: tuple[str],
+    *args: str,
     env: dict | None = None,
+    cwd: str | Path | None = None,
     prefix: list[str] = [],
     sleep_after: float | None = None,
 ) -> Popen:
-    result = run_async(prefix + python(version), *args, env=env)
+    result = run_async(prefix + python(version), *args, env=env, cwd=cwd)
 
     if sleep_after is not None:
         sleep(sleep_after)
@@ -308,8 +447,87 @@ def run_python(
     return result
 
 
-def samples(data: str) -> Iterator[bytes]:
-    return (_ for _ in data.splitlines() if _ and _[0] == "P")
+def retry_until(
+    run: Callable[[], CompletedProcess],
+    predicate: Callable[[CompletedProcess], bool],
+    attempts: int = 15,
+    interval: float = 0.15,
+) -> CompletedProcess:
+    """
+    Repeatedly calls `run` (an austin invocation) until `predicate(result)`
+    is true, instead of a single snapshot after a fixed sleep -- e.g. a
+    freshly-spawned process's second thread, or a native-mode unwind
+    reaching real user code, isn't guaranteed to exist yet after any fixed
+    delay on a loaded CI runner.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+
+    # The final attempt is unguarded, outside the loop: whatever it does --
+    # raise or return a result predicate still doesn't match -- is the real
+    # answer once retries are exhausted, not something to swallow.
+    for _ in range(attempts - 1):
+        try:
+            result = run()
+        except RuntimeError:
+            sleep(interval)
+            continue
+
+        if predicate(result):
+            return result
+
+        sleep(interval)
+
+    return run()
+
+
+def retry_where(
+    pid: int,
+    predicate: Callable[[str], bool],
+    attempts: int = 15,
+    interval: float = 0.15,
+) -> CompletedProcess:
+    """
+    Repeatedly samples `pid` with ``austin -w`` until
+    ``predicate(result.stdout)`` is true, instead of a single snapshot after a
+    fixed sleep.
+    """
+    return retry_until(
+        lambda: austin("-w", str(pid)),
+        lambda result: predicate(result.stdout),
+        attempts=attempts,
+        interval=interval,
+    )
+
+
+def get_free_port() -> int:
+    """Ask the OS for an unused TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
+
+
+def wait_for_port(
+    host: str, port: int, timeout: float = 10.0, interval: float = 0.1
+) -> None:
+    """Poll a TCP port until something is listening on it.
+
+    A raw connect() succeeding is a much more direct "is the server actually
+    up" signal than guessing a fixed delay -- and, when the server on the
+    other end blocks on accept() as its own synchronisation point, this
+    connection is also what lets it proceed.
+    """
+    deadline = monotonic() + timeout
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=interval):
+                return
+        except OSError:
+            if monotonic() >= deadline:
+                raise TimeoutError(
+                    f"nothing started listening on {host}:{port} within {timeout}s"
+                )
+            sleep(interval)
 
 
 T = TypeVar("T")
@@ -324,28 +542,14 @@ def denoise(data: Iterator[T], threshold: float = 0.1) -> set[T]:
     return {t for t, c in c.items() if c / m > threshold}
 
 
-def processes(data: str) -> set[str]:
-    return denoise(_.partition(";")[0] for _ in samples(data))
+def processes(samples: List[AustinSample]) -> set[str]:
+    return denoise(_.pid for _ in samples)
 
 
-def threads(data: str, threshold: float = 0.1) -> set[tuple[str, str]]:
-    return denoise(
-        tuple(_.rpartition(" ")[0].split(";", maxsplit=2)[:2]) for _ in samples(data)
-    )
-
-
-def metadata(data: str) -> dict[str, str]:
-    meta = dict(
-        _[1:].strip().split(": ", maxsplit=1)
-        for _ in data.splitlines()
-        if _ and _[0] == "#" and not _.startswith("# map:")
-    )
-
-    for v in ("austin", "python"):
-        if v in meta:
-            meta[v] = tuple(int(_.replace("?", "-1")) for _ in meta[v].split(".")[:3])
-
-    return meta
+def threads(
+    samples: List[AustinSample], threshold: float = 0.1
+) -> set[tuple[str, str, str]]:
+    return denoise(((_.pid, _.thread, _.iid) for _ in samples), threshold)
 
 
 def maps(data: str) -> defaultdict[str, list[str]]:
@@ -359,63 +563,53 @@ def maps(data: str) -> defaultdict[str, list[str]]:
     return maps
 
 
-def has_pattern(data: str, pattern: str) -> bool:
-    for _ in samples(data):
-        if pattern in _:
-            return True
+def has_frame(
+    samples: List[AustinSample],
+    filename,
+    function,
+    line=None,
+    line_end=None,
+    column=None,
+    column_end=None,
+):
+    for sample in samples:
+        if not sample.frames:
+            continue
+        for frame in sample.frames:
+            if all(
+                (
+                    Path(frame.filename).name == filename,
+                    frame.function == function,
+                    line is None or frame.line == line,
+                    line_end is None or frame.line_end == line_end,
+                    column is None or frame.column == column,
+                    column_end is None or frame.column_end == column,
+                )
+            ):
+                return True
     return False
 
 
-def sum_metric(data: str) -> int:
-    return sum(int(_.rpartition(" ")[-1]) for _ in samples(data))
-
-
-def sum_metrics(data: str) -> tuple[int, int, int, int]:
-    wall = cpu = alloc = dealloc = 0
-    for t, i, m in (
-        _.rpartition(" ")[-1].split(",", maxsplit=2) for _ in samples(data)
-    ):
-        time = int(t)
-        wall += time
-        if i == "0":
-            cpu += time
-
-        memory = int(m)
-        if memory > 0:
-            alloc += memory
-        else:
-            dealloc += memory
-
-    return wall, cpu, alloc, dealloc
-
-
-def compress(data: str) -> str:
-    stacks: dict[str, int] = {}
-
-    for _ in (_.strip() for _ in data.splitlines() if _ and _[0] == "P"):
-        stack, _, metric = _.rpartition(" ")
-        stacks[stack] = stacks.setdefault(stack, 0) + int(metric)
-
-    compressed_stacks = "\n".join((f"{k} {v}" for k, v in stacks.items()))
-
-    output = (
-        f"# Metadata\n{metadata(data)}\n\n# Stacks\n{compressed_stacks or '<no data>'}"
+def sum_metrics(samples: List[AustinSample]) -> tuple[int, int]:
+    return sum(_.metrics.time or 0 for _ in samples), sum(
+        _.metrics.memory or 0 for _ in samples
     )
 
-    ms = maps(data)
-    if ms:
-        output = f"# Maps\n{list(ms.keys())}\n\n" + output
 
-    return output
+def sum_full_metrics(samples: List[AustinSample]) -> tuple[int, int, int, int]:
+    mem = [_.metrics.memory or 0 for _ in samples]
+    return (
+        sum(_.metrics.time or 0 for _ in samples),
+        sum(_.metrics.time or 0 for _ in samples if not _.idle),
+        sum(_ for _ in mem if _ > 0),
+        sum(_ for _ in mem if _ < 0),
+    )
 
 
-def demojo(data: bytes) -> str:
-    result = StringIO()
-
-    for e in MojoFile(BytesIO(data)).parse():
-        result.write(e.to_austin())
-
-    return result.getvalue()
+def parse_mojo(data: bytes) -> Tuple[List[AustinSample], Dict[str, str]]:
+    mojo = MojoStreamReader(BytesIO(data))
+    samples = [_ for _ in mojo if isinstance(_, AustinSample)]
+    return samples, mojo.metadata
 
 
 # Load from the utils scripts
@@ -432,7 +626,7 @@ def load_util(name: str) -> ModuleType:
 
 
 if pytest is not None:
-    variants = pytest.mark.parametrize("austin", Variant.ALL)
+    variants = pytest.mark.parametrize("austin", Variant.ALL, ids=lambda v: v.name)
 
     match platform.system():
         case "Windows":
@@ -444,5 +638,3 @@ if pytest is not None:
             no_sudo = pytest.mark.skipif(
                 os.geteuid() == 0, reason="Must not have superuser privileges"
             )
-
-    mojo = pytest.mark.parametrize("mojo", [False, True])

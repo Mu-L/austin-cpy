@@ -25,8 +25,7 @@
 //                   Python. The authors of those sources hold the copyright
 //                   for most of the content of this header file.
 
-#ifndef PYTHON_IFRAME_H
-#define PYTHON_IFRAME_H
+#pragma once
 
 #include <stdint.h>
 
@@ -36,59 +35,77 @@
 
 typedef struct _PyInterpreterFrame3_11 {
     /* "Specials" section */
-    PyFunctionObject *f_func; /* Strong reference */
-    PyObject *f_globals; /* Borrowed reference */
-    PyObject *f_builtins; /* Borrowed reference */
-    PyObject *f_locals; /* Strong reference, may be NULL */
-    PyCodeObject *f_code; /* Strong reference */
-    PyFrameObject *frame_obj; /* Strong reference, may be NULL */
+    PyFunctionObject*               f_func;     /* Strong reference */
+    PyObject*                       f_globals;  /* Borrowed reference */
+    PyObject*                       f_builtins; /* Borrowed reference */
+    PyObject*                       f_locals;   /* Strong reference, may be NULL */
+    PyCodeObject*                   f_code;     /* Strong reference */
+    PyFrameObject*                  frame_obj;  /* Strong reference, may be NULL */
     /* Linkage section */
-    struct _PyInterpreterFrame3_11 *previous;
+    struct _PyInterpreterFrame3_11* previous;
     // NOTE: This is not necessarily the last instruction started in the given
     // frame. Rather, it is the code unit *prior to* the *next* instruction. For
     // example, it may be an inline CACHE entry, an instruction we just jumped
     // over, or (in the case of a newly-created frame) a totally invalid value:
-    _Py_CODEUNIT *prev_instr;
-    int stacktop;     /* Offset of TOS from localsplus  */
-    bool is_entry;  // Whether this is the "root" frame for the current _PyCFrame.
-    char owner;
+    _Py_CODEUNIT*                   prev_instr;
+    int                             stacktop; /* Offset of TOS from localsplus  */
+    bool                            is_entry; // Whether this is the "root" frame for the current _PyCFrame.
+    char                            owner;
     /* Locals and stack */
-    PyObject *localsplus[1];
+    PyObject*                       localsplus[1];
 } _PyInterpreterFrame3_11;
 
+// Owners at or above this value mark non-Python shim/entry frames:
+//   3.12-3.13: FRAME_OWNED_BY_CSTACK = 3
+//   3.14:      FRAME_OWNED_BY_INTERPRETER = 3, FRAME_OWNED_BY_CSTACK = 4
+//   3.15+:     FRAME_OWNED_BY_INTERPRETER = 3
+#define FRAME_OWNED_BY_SHIM 3
 
-#define FRAME_OWNED_BY_CSTACK 3
+// _PyFrameState (Include/internal/pycore_frame.h) -- numbering changed
+// between 3.14 and 3.15 (3.15 adds a distinct "locked" yield-from variant
+// for free-threading), so every value needs a version-suffixed name; there
+// is no single FRAME_EXECUTING etc. that would be correct for both.
+#define FRAME_CREATED_3_14              (-3)
+#define FRAME_SUSPENDED_3_14            (-2)
+#define FRAME_SUSPENDED_YIELD_FROM_3_14 (-1)
+#define FRAME_EXECUTING_3_14            (0)
+#define FRAME_COMPLETED_3_14            (1)
+#define FRAME_CLEARED_3_14              (4)
+
+#define FRAME_CREATED_3_15                     (0)
+#define FRAME_SUSPENDED_3_15                   (1)
+#define FRAME_SUSPENDED_YIELD_FROM_3_15        (2)
+#define FRAME_SUSPENDED_YIELD_FROM_LOCKED_3_15 (3)
+#define FRAME_EXECUTING_3_15                   (4)
+#define FRAME_CLEARED_3_15                     (5)
 
 typedef struct _PyInterpreterFrame3_12 {
-    PyCodeObject *f_code; /* Strong reference */
-    struct _PyInterpreterFrame3_12 *previous;
-    PyObject *f_funcobj; /* Strong reference. Only valid if not on C stack */
-    PyObject *f_globals; /* Borrowed reference. Only valid if not on C stack */
-    PyObject *f_builtins; /* Borrowed reference. Only valid if not on C stack */
-    PyObject *f_locals; /* Strong reference, may be NULL. Only valid if not on C stack */
-    PyFrameObject *frame_obj; /* Strong reference, may be NULL. Only valid if not on C stack */
+    PyCodeObject*                   f_code; /* Strong reference */
+    struct _PyInterpreterFrame3_12* previous;
+    PyObject*                       f_funcobj;  /* Strong reference. Only valid if not on C stack */
+    PyObject*                       f_globals;  /* Borrowed reference. Only valid if not on C stack */
+    PyObject*                       f_builtins; /* Borrowed reference. Only valid if not on C stack */
+    PyObject*                       f_locals;   /* Strong reference, may be NULL. Only valid if not on C stack */
+    PyFrameObject*                  frame_obj;  /* Strong reference, may be NULL. Only valid if not on C stack */
     // NOTE: This is not necessarily the last instruction started in the given
     // frame. Rather, it is the code unit *prior to* the *next* instruction. For
     // example, it may be an inline CACHE entry, an instruction we just jumped
     // over, or (in the case of a newly-created frame) a totally invalid value:
-    _Py_CODEUNIT *prev_instr;
-    int stacktop;  /* Offset of TOS from localsplus  */
+    _Py_CODEUNIT*                   prev_instr;
+    int                             stacktop; /* Offset of TOS from localsplus  */
     /* The return_offset determines where a `RETURN` should go in the caller,
      * relative to `prev_instr`.
      * It is only meaningful to the callee,
      * so it needs to be set in any CALL (to a Python function)
      * or SEND (to a coroutine or generator).
      * If there is no callee, then it is meaningless. */
-    uint16_t return_offset;
-    char owner;
+    uint16_t                        return_offset;
+    char                            owner;
     /* Locals and stack */
-    PyObject *localsplus[1];
+    PyObject*                       localsplus[1];
 } _PyInterpreterFrame3_12;
-
 
 typedef union {
     _PyInterpreterFrame3_11 v3_11;
     _PyInterpreterFrame3_12 v3_12;
 } PyInterpreterFrame;
-
-#endif

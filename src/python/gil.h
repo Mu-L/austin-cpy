@@ -25,25 +25,32 @@
 //                   Python. The authors of those sources hold the copyright
 //                   for most of the content of this header file.
 
-#ifndef PYTHON_GIL_H
-#define PYTHON_GIL_H
+#pragma once
 
 #include "interp.h"
 #include "misc.h"
 
 struct _gilstate_runtime_state3_11 {
-  int check_enabled;
-  _Py_atomic_address tstate_current;
-  PyInterpreterState *autoInterpreterState;
-  Py_tss_t autoTSSkey;
+    int                 check_enabled;
+    _Py_atomic_address  tstate_current;
+    PyInterpreterState* autoInterpreterState;
+    Py_tss_t            autoTSSkey;
 };
 
 struct _gil_runtime_state3_11 {
-  unsigned long interval;
-  _Py_atomic_address last_holder;
-  _Py_atomic_int locked;
+    unsigned long      interval;
+    _Py_atomic_address last_holder;
+    _Py_atomic_int     locked;
 };
 
-typedef struct _gil_runtime_state3_11 gil_state_t;
+// Free-threaded builds (3.13+) prepend an `enabled` field, which is 0 when the
+// GIL is disabled and non-zero when it is enabled (transiently or permanently).
+struct _gil_runtime_state3_13t {
+    int                enabled;
+    unsigned long      interval;
+    _Py_atomic_address last_holder;
+    _Py_atomic_int     locked;
+};
 
-#endif
+typedef struct _gil_runtime_state3_11  gil_state_t;
+typedef struct _gil_runtime_state3_13t gil_state_ft_t;

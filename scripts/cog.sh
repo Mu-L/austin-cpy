@@ -8,8 +8,6 @@ fi
 
 cog -P $args \
     configure.ac \
-    README.md \
+    docs/usage.md \
     src/austin.h \
-    src/argparse.c \
-    src/linux/py_proc.h \
     snap/snapcraft.yaml
